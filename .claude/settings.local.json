@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(langgraph dev:*)",
+      "Bash(echo $VIRTUAL_ENV)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run:*)",
+      "Bash(lsof:*)",
+      "Bash(curl:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
