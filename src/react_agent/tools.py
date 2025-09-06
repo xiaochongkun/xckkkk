@@ -9,7 +9,7 @@ These tools enable complete Twitter account management through AI agents.
 import asyncio
 import logging
 import time
-from typing import Any, Callable, List, Optional, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
 # Load environment variables first - must be before other imports
 from dotenv import load_dotenv
@@ -24,6 +24,11 @@ from langchain_tavily import TavilySearch  # noqa: E402
 from langgraph.runtime import get_runtime  # noqa: E402
 
 from react_agent.context import Context  # noqa: E402
+from react_agent.monitoring import (  # noqa: E402
+    record_error,
+    record_mcp_connection_attempt,
+    track_async_tool_usage,
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -58,7 +63,7 @@ def _update_connection_health(server_name: str, success: bool) -> None:
             "last_success": None,
             "last_failure": None,
         }
-    
+
     current_time = time.time()
     if success:
         _connection_health[server_name]["success_count"] += 1
@@ -79,105 +84,138 @@ def _update_circuit_breaker(server_name: str) -> None:
         _circuit_breaker[server_name] = {
             "failure_count": 0,
             "last_failure": None,
-            "is_open": False
+            "is_open": False,
         }
-    
+
     _circuit_breaker[server_name]["failure_count"] += 1
     _circuit_breaker[server_name]["last_failure"] = time.time()
-    
+
     if _circuit_breaker[server_name]["failure_count"] >= CIRCUIT_BREAKER_THRESHOLD:
         _circuit_breaker[server_name]["is_open"] = True
-        logger.warning(f"🔥 Circuit breaker opened for {server_name} after {CIRCUIT_BREAKER_THRESHOLD} failures")
+        logger.warning(
+            f"🔥 Circuit breaker opened for {server_name} after {CIRCUIT_BREAKER_THRESHOLD} failures"
+        )
 
 
 def _is_circuit_breaker_open(server_name: str) -> bool:
     """Check if circuit breaker is open for a server."""
     if server_name not in _circuit_breaker:
         return False
-    
+
     breaker = _circuit_breaker[server_name]
     if not breaker["is_open"]:
         return False
-    
+
     # Check if timeout period has passed
-    if breaker["last_failure"] and (time.time() - breaker["last_failure"]) > CIRCUIT_BREAKER_TIMEOUT:
+    if (
+        breaker["last_failure"]
+        and (time.time() - breaker["last_failure"]) > CIRCUIT_BREAKER_TIMEOUT
+    ):
         # Reset circuit breaker
         _circuit_breaker[server_name]["is_open"] = False
         _circuit_breaker[server_name]["failure_count"] = 0
         logger.info(f"🔄 Circuit breaker reset for {server_name}")
         return False
-    
+
     return True
 
 
-async def _execute_tool_with_timeout(tool_func: Callable, *args, **kwargs) -> Any:
+async def _execute_tool_with_timeout(
+    tool_func: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any
+) -> Any:
     """Execute a tool function with timeout protection."""
     try:
-        return await asyncio.wait_for(tool_func(*args, **kwargs), timeout=TOOL_EXECUTION_TIMEOUT)
-    except asyncio.TimeoutError:
+        return await asyncio.wait_for(
+            tool_func(*args, **kwargs), timeout=TOOL_EXECUTION_TIMEOUT
+        )
+    except TimeoutError:
         logger.error(f"⏱️ Tool execution timed out after {TOOL_EXECUTION_TIMEOUT}s")
         return {
-            "error": f"Tool execution timed out after {TOOL_EXECUTION_TIMEOUT}s", 
-            "status": "timeout"
+            "error": f"Tool execution timed out after {TOOL_EXECUTION_TIMEOUT}s",
+            "status": "timeout",
         }
     except Exception as e:
         logger.error(f"❌ Tool execution failed: {e}")
-        return {
-            "error": f"Tool execution failed: {e}", 
-            "status": "error"
-        }
+        return {"error": f"Tool execution failed: {e}", "status": "error"}
 
 
-async def _connect_server_with_retry(server: dict[str, Any], tools_dict: dict[str, Any]) -> bool:
+async def _connect_server_with_retry(
+    server: dict[str, Any], tools_dict: dict[str, Any]
+) -> bool:
     """Connect to MCP server with exponential backoff retry logic."""
     server_name = server["name"]
-    
+
     # Check circuit breaker
     if _is_circuit_breaker_open(server_name):
-        logger.warning(f"🔥 Circuit breaker is open for {server_name}, skipping connection attempt")
+        logger.warning(
+            f"🔥 Circuit breaker is open for {server_name}, skipping connection attempt"
+        )
         return False
-    
+
     for attempt in range(MAX_RETRIES):
         try:
-            logger.info(f"Attempting to connect to {server_name} server (attempt {attempt + 1}/{MAX_RETRIES})...")
-            
+            logger.info(
+                f"Attempting to connect to {server_name} server (attempt {attempt + 1}/{MAX_RETRIES})..."
+            )
+
             # Calculate retry delay with exponential backoff
             if attempt > 0:
                 delay = min(BASE_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
                 logger.info(f"Waiting {delay:.1f}s before retry...")
                 await asyncio.sleep(delay)
-            
+
             # Timeout per server (8 seconds)
-            async def connect_with_enhanced_timeout():
+            async def connect_with_enhanced_timeout() -> List[Any]:
                 client = MultiServerMCPClient({server_name: server["config"]})
                 return await client.get_tools()
-            
-            tools = await asyncio.wait_for(connect_with_enhanced_timeout(), timeout=MCP_CONNECTION_TIMEOUT)
-            
+
+            tools = await asyncio.wait_for(
+                connect_with_enhanced_timeout(), timeout=MCP_CONNECTION_TIMEOUT
+            )
+
             # Success - add tools and update health
             for tool in tools:
                 tools_dict[tool.name] = tool
-            
-            logger.info(f"✅ Successfully connected to {server_name}, loaded {len(tools)} tools")
+
+            logger.info(
+                f"✅ Successfully connected to {server_name}, loaded {len(tools)} tools"
+            )
             _update_connection_health(server_name, True)
+            record_mcp_connection_attempt(server_name, True)
             return True
-            
+
         except TimeoutError:
-            logger.warning(f"⏱️ Connection to {server_name} timed out (attempt {attempt + 1})")
+            logger.warning(
+                f"⏱️ Connection to {server_name} timed out (attempt {attempt + 1})"
+            )
             if attempt == MAX_RETRIES - 1:
-                logger.error(f"❌ Failed to connect to {server_name} after {MAX_RETRIES} attempts")
+                logger.error(
+                    f"❌ Failed to connect to {server_name} after {MAX_RETRIES} attempts"
+                )
                 _update_connection_health(server_name, False)
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException, httpx.ReadError) as e:
-            logger.warning(f"🌐 HTTP error connecting to {server_name} (attempt {attempt + 1}): {type(e).__name__}")
+        except (
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.TimeoutException,
+            httpx.ReadError,
+        ) as e:
+            logger.warning(
+                f"🌐 HTTP error connecting to {server_name} (attempt {attempt + 1}): {type(e).__name__}"
+            )
             if attempt == MAX_RETRIES - 1:
-                logger.error(f"❌ HTTP connection to {server_name} failed after {MAX_RETRIES} attempts")
+                logger.error(
+                    f"❌ HTTP connection to {server_name} failed after {MAX_RETRIES} attempts"
+                )
                 _update_connection_health(server_name, False)
         except Exception as e:
-            logger.warning(f"⚠️ Unexpected error connecting to {server_name} (attempt {attempt + 1}): {e}")
+            logger.warning(
+                f"⚠️ Unexpected error connecting to {server_name} (attempt {attempt + 1}): {e}"
+            )
             if attempt == MAX_RETRIES - 1:
                 logger.error(f"❌ Connection to {server_name} failed with error: {e}")
                 _update_connection_health(server_name, False)
-    
+                record_mcp_connection_attempt(server_name, False, str(e))
+
     return False
 
 
@@ -188,8 +226,8 @@ async def _get_connection_status() -> dict[str, Any]:
         "cache_status": {
             "has_cache": _mcp_tools_cache is not None,
             "cache_age": time.time() - _cache_timestamp if _cache_timestamp else None,
-            "cache_tools_count": len(_mcp_tools_cache) if _mcp_tools_cache else 0
-        }
+            "cache_tools_count": len(_mcp_tools_cache) if _mcp_tools_cache else 0,
+        },
     }
 
 
@@ -209,7 +247,9 @@ async def _get_all_mcp_tools() -> dict[str, Any]:
         # Reduce timeout to 15 seconds to prevent hanging
         return await asyncio.wait_for(_get_all_mcp_tools_impl(), timeout=15.0)
     except TimeoutError:
-        logger.warning("MCP tools initialization timed out after 15 seconds, using cached tools if available")
+        logger.warning(
+            "MCP tools initialization timed out after 15 seconds, using cached tools if available"
+        )
         # Fallback to cached tools if available
         if _mcp_tools_cache is not None:
             logger.info("Using stale cached MCP tools as fallback")
@@ -227,16 +267,18 @@ async def _get_all_mcp_tools() -> dict[str, Any]:
 async def _get_all_mcp_tools_impl() -> dict[str, Any]:
     """Load MCP tools with enhanced caching and health checking."""
     global _mcp_tools_cache, _cache_timestamp
-    
+
     current_time = time.time()
-    
+
     # Check cache first - use fresher cache in case of recent failures
-    if (_mcp_tools_cache is not None and 
-        _cache_timestamp is not None and 
-        current_time - _cache_timestamp < CACHE_DURATION):
+    if (
+        _mcp_tools_cache is not None
+        and _cache_timestamp is not None
+        and current_time - _cache_timestamp < CACHE_DURATION
+    ):
         # Check if we should refresh cache due to recent failures
         recent_failures = any(
-            (health.get('last_failure') or 0) > (health.get('last_success') or 0)
+            (health.get("last_failure") or 0) > (health.get("last_success") or 0)
             for health in _connection_health.values()
         )
         if not recent_failures:
@@ -244,8 +286,8 @@ async def _get_all_mcp_tools_impl() -> dict[str, Any]:
             return _mcp_tools_cache
         else:
             logger.info("Recent connection failures detected, refreshing MCP tools...")
-    
-    tools_dict = {}
+
+    tools_dict: Dict[str, Any] = {}
 
     # Define server configurations - let MCP client handle its own timeouts
     servers = [
@@ -257,9 +299,9 @@ async def _get_all_mcp_tools_impl() -> dict[str, Any]:
             },
         },
         {
-            "name": "remote_server", 
+            "name": "remote_server",
             "config": {
-                "url": "https://twitter-mcp.gc.rrrr.run/sse", 
+                "url": "https://twitter-mcp.gc.rrrr.run/sse",
                 "transport": "sse",
             },
         },
@@ -303,35 +345,47 @@ async def _get_all_mcp_tools_impl() -> dict[str, Any]:
     missing_tools = required_tools - set(filtered_tools.keys())
     if missing_tools:
         logger.warning(f"Missing Twitter tools (services unavailable): {missing_tools}")
-    
+
     # Enhanced status reporting
     if not filtered_tools:
         logger.warning("No MCP tools available - falling back to search-only mode")
         logger.info(f"Connection health: {_connection_health}")
     else:
         logger.info(f"Successfully loaded {len(filtered_tools)} MCP tools")
-        available_services = [name for name, health in _connection_health.items() if health.get('last_success')]
+        available_services = [
+            name
+            for name, health in _connection_health.items()
+            if health.get("last_success")
+        ]
         logger.info(f"Available services: {available_services}")
-        
+
         # Log connection quality
         for server_name, health in _connection_health.items():
-            success_rate = health['success_count'] / (health['success_count'] + health['failure_count']) if (health['success_count'] + health['failure_count']) > 0 else 0
-            logger.info(f"{server_name} connection quality: {success_rate:.1%} success rate")
+            success_rate = (
+                health["success_count"]
+                / (health["success_count"] + health["failure_count"])
+                if (health["success_count"] + health["failure_count"]) > 0
+                else 0
+            )
+            logger.info(
+                f"{server_name} connection quality: {success_rate:.1%} success rate"
+            )
 
     # Cache results (even if partial success)
     if filtered_tools or _mcp_tools_cache is None:
         _mcp_tools_cache = filtered_tools
         _cache_timestamp = current_time
         logger.info(f"Cached {len(filtered_tools)} tools for future fallback")
-        
+
         # Log detailed cache status
         cache_status = await _get_connection_status()
         logger.debug(f"Cache status: {cache_status}")
-    
+
     return filtered_tools
 
 
-async def search(query: str) -> Optional[dict[str, Any]]:
+@track_async_tool_usage("search")
+async def search(query: str) -> Dict[str, Any]:
     """Search for general web results.
 
     This function performs a search using the Tavily search engine, which is designed
@@ -340,16 +394,18 @@ async def search(query: str) -> Optional[dict[str, Any]]:
     """
     runtime = get_runtime(Context)
     wrapped = TavilySearch(max_results=runtime.context.max_search_results)
-    
-    async def _search_impl():
+
+    async def _search_impl() -> Dict[str, Any]:
         return cast(dict[str, Any], await wrapped.ainvoke({"query": query}))
-    
-    return await _execute_tool_with_timeout(_search_impl)
+
+    result = await _execute_tool_with_timeout(_search_impl)
+    return cast(Dict[str, Any], result)
 
 
 # === Twitter Write Operations ===
 
 
+@track_async_tool_usage("post_tweet")
 async def post_tweet(
     text: str, media_inputs: Optional[List[str]] = None
 ) -> dict[str, Any]:
@@ -364,14 +420,15 @@ async def post_tweet(
     """
     global _mcp_tools_cache
     runtime = get_runtime(Context)
-    
+
     # Retry tool loading if needed
     for attempt in range(2):  # Try twice
         tools = await _get_all_mcp_tools()
-        
+
         if "post_tweet" in tools:
             try:
-                async def _post_impl():
+
+                async def _post_impl() -> Any:
                     return await tools["post_tweet"].ainvoke(
                         {
                             "text": text,
@@ -379,7 +436,7 @@ async def post_tweet(
                             "media_inputs": media_inputs or [],
                         }
                     )
-                
+
                 result = await _execute_tool_with_timeout(_post_impl)
                 return cast(dict[str, Any], result)
             except Exception as e:
@@ -391,18 +448,20 @@ async def post_tweet(
                 else:
                     return {"error": f"Twitter posting failed: {e}", "status": "failed"}
         else:
-            logger.warning(f"Twitter posting service unavailable (attempt {attempt + 1})")
+            logger.warning(
+                f"Twitter posting service unavailable (attempt {attempt + 1})"
+            )
             if attempt == 0:
                 # Clear cache and retry
                 _mcp_tools_cache = None
                 await asyncio.sleep(1)
-    
+
     # Final fallback
     connection_status = await _get_connection_status()
     return {
-        "error": "Twitter posting service unavailable after retries", 
+        "error": "Twitter posting service unavailable after retries",
         "status": "failed",
-        "debug_info": connection_status
+        "debug_info": connection_status,
     }
 
 
@@ -417,15 +476,15 @@ async def delete_tweet(tweet_id: str) -> dict[str, Any]:
     """
     runtime = get_runtime(Context)
     tools = await _get_all_mcp_tools()
-    
+
     if "delete_tweet" not in tools:
         connection_status = await _get_connection_status()
         return {
-            "error": "Twitter delete service unavailable", 
+            "error": "Twitter delete service unavailable",
             "status": "failed",
-            "debug_info": connection_status
+            "debug_info": connection_status,
         }
-    
+
     try:
         result = await tools["delete_tweet"].ainvoke(
             {"tweet_id": tweet_id, "user_id": runtime.context.twitter_user_id}
@@ -447,15 +506,15 @@ async def like_tweet(tweet_id: str) -> dict[str, Any]:
     """
     runtime = get_runtime(Context)
     tools = await _get_all_mcp_tools()
-    
+
     if "like_tweet" not in tools:
         connection_status = await _get_connection_status()
         return {
-            "error": "Twitter like service unavailable", 
+            "error": "Twitter like service unavailable",
             "status": "failed",
-            "debug_info": connection_status
+            "debug_info": connection_status,
         }
-    
+
     try:
         result = await tools["like_tweet"].ainvoke(
             {"tweet_id": tweet_id, "user_id": runtime.context.twitter_user_id}
@@ -477,15 +536,15 @@ async def retweet(tweet_id: str) -> dict[str, Any]:
     """
     runtime = get_runtime(Context)
     tools = await _get_all_mcp_tools()
-    
+
     if "retweet" not in tools:
         connection_status = await _get_connection_status()
         return {
-            "error": "Twitter retweet service unavailable", 
+            "error": "Twitter retweet service unavailable",
             "status": "failed",
-            "debug_info": connection_status
+            "debug_info": connection_status,
         }
-    
+
     try:
         result = await tools["retweet"].ainvoke(
             {"tweet_id": tweet_id, "user_id": runtime.context.twitter_user_id}
@@ -516,19 +575,20 @@ async def advanced_search_twitter(query: str) -> dict[str, Any]:
         dict: Search results with matching tweets
     """
     tools = await _get_all_mcp_tools()
-    
+
     if "advanced_search_twitter" not in tools:
         connection_status = await _get_connection_status()
         return {
-            "error": "Twitter search service unavailable", 
+            "error": "Twitter search service unavailable",
             "status": "failed",
-            "debug_info": connection_status
+            "debug_info": connection_status,
         }
-    
+
     try:
-        async def _search_impl():
+
+        async def _search_impl() -> Any:
             return await tools["advanced_search_twitter"].ainvoke({"llm_text": query})
-        
+
         result = await _execute_tool_with_timeout(_search_impl)
         return cast(dict[str, Any], result)
     except Exception as e:
@@ -574,59 +634,77 @@ async def get_tweet_quotations(tweet_id: str) -> dict[str, Any]:
 async def get_tweet_thread_context(tweet_id: str) -> dict[str, Any]:
     """Get tweet thread context - understand complete conversation flow."""
     tools = await _get_all_mcp_tools()
-    
+
     if "get_tweet_thread_context" not in tools:
-        return {"error": "Twitter thread context service unavailable", "status": "failed"}
-    
+        return {
+            "error": "Twitter thread context service unavailable",
+            "status": "failed",
+        }
+
     try:
         result = await tools["get_tweet_thread_context"].ainvoke({"tweetId": tweet_id})
         return cast(dict[str, Any], result)
     except Exception as e:
         logger.error(f"Getting tweet thread context failed: {e}")
-        return {"error": f"Getting tweet thread context failed: {e}", "status": "failed"}
+        return {
+            "error": f"Getting tweet thread context failed: {e}",
+            "status": "failed",
+        }
 
 
 async def check_twitter_connection_status() -> dict[str, Any]:
     """Check Twitter MCP connection status and health metrics.
-    
+
     Returns:
         dict: Detailed connection status and health information
     """
     logger.info("Checking Twitter MCP connection status...")
-    
+
     try:
         # Force refresh tools to get current status
         global _mcp_tools_cache
         _mcp_tools_cache = None
         tools = await _get_all_mcp_tools()
-        
-        twitter_tools = [name for name in tools.keys() if 'tweet' in name]
+
+        twitter_tools = [name for name in tools.keys() if "tweet" in name]
         connection_status = await _get_connection_status()
-        
+
         return {
             "status": "healthy" if twitter_tools else "degraded",
             "available_twitter_tools": twitter_tools,
             "total_tools": len(tools),
             "connection_health": connection_status,
-            "user_id": "76d4a28f-7a35-4d45-a3a3-c64a1637207e"
+            "user_id": "76d4a28f-7a35-4d45-a3a3-c64a1637207e",
         }
     except Exception as e:
         logger.error(f"Connection status check failed: {e}")
+        record_error("connection_check_failed", str(e))
         return {
             "status": "error",
             "error": str(e),
-            "connection_health": _connection_health
+            "connection_health": _connection_health,
         }
 
 
+async def get_system_health() -> dict[str, Any]:
+    """Get comprehensive system health status including monitoring data.
+    
+    Returns:
+        dict: Comprehensive health information from monitoring system
+    """
+    from react_agent.monitoring import health_check
+    return await health_check()
+
+
 TOOLS: List[Callable[..., Any]] = [
-    # Core tools (6)
+    # Core tools (7)
     search,
     post_tweet,
     delete_tweet,
     like_tweet,
     retweet,
     check_twitter_connection_status,
+    get_system_health,
     # Read tools (6)
     advanced_search_twitter,
     get_trends,

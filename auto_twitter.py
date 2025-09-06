@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""
-自动Twitter运营脚本示例
+"""自动Twitter运营脚本示例。
+
 定期收集信息并发布推文
 """
 

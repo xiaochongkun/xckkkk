@@ -64,16 +64,21 @@ async def call_model(
     return {"messages": [response]}
 
 
-async def handle_tool_error(state: State, error: Exception) -> Dict[str, List[ToolMessage]]:
+async def handle_tool_error(
+    state: State, error: Exception
+) -> Dict[str, List[ToolMessage]]:
     """Handle tool execution errors gracefully."""
     error_msg = f"Tool execution failed: {str(error)}"
-    
+
+    # Get tool call ID safely
+    tool_call_id: str = "unknown"
+    if state.messages and isinstance(state.messages[-1], AIMessage):
+        if hasattr(state.messages[-1], "tool_calls") and state.messages[-1].tool_calls:
+            tool_call_id = str(state.messages[-1].tool_calls[0]["id"])
+
     # Create a tool message indicating the error
-    tool_message = ToolMessage(
-        content=error_msg,
-        tool_call_id=state.messages[-1].tool_calls[0]["id"] if state.messages[-1].tool_calls else "unknown"
-    )
-    
+    tool_message = ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+
     return {"messages": [tool_message]}
 
 
